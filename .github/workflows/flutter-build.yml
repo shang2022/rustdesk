@@ -24,8 +24,8 @@ env:
   SCITER_ARMV7_CMAKE_VERSION: "3.29.7"
   SCITER_NASM_DEBVERSION: "2.14-1"
   LLVM_VERSION: "15.0.6"
-  FLUTTER_VERSION: "3.24.4"
-  ANDROID_FLUTTER_VERSION: "3.24.4"
+  FLUTTER_VERSION: "3.24.5"
+  ANDROID_FLUTTER_VERSION: "3.24.5"
   # for arm64 linux because official Dart SDK does not work
   FLUTTER_ELINUX_VERSION: "3.16.9"
   TAG_NAME: "${{ inputs.upload-tag }}"
@@ -103,7 +103,6 @@ jobs:
         with:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          cache: true
 
       # https://github.com/flutter/flutter/issues/155685
       - name: Replace engine with rustdesk custom flutter engine
@@ -113,6 +112,13 @@ jobs:
           Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
           Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
           mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -399,7 +405,7 @@ jobs:
       - name: Restore bridge files
         uses: actions/download-artifact@master
         with:
-          name: bridge-artifact-macos
+          name: bridge-artifact
           path: ./
 
       - name: Build rustdesk
@@ -486,6 +492,11 @@ jobs:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
       - name: Setup vcpkg with Github Actions binary cache
         uses: lukka/run-vcpkg@v11
         with:
@@ -524,7 +535,7 @@ jobs:
       - name: Restore bridge files
         uses: actions/download-artifact@master
         with:
-          name: bridge-artifact-macos
+          name: bridge-artifact
           path: ./
 
       - name: Build rustdesk lib
@@ -579,7 +590,7 @@ jobs:
       - name: Restore bridge files
         uses: actions/download-artifact@master
         with:
-          name: bridge-artifact-macos
+          name: bridge-artifact
           path: ./
 
       - name: Build rustdesk lib
@@ -679,13 +690,24 @@ jobs:
 
       - name: Install build runtime
         run: |
-          brew install llvm create-dmg nasm cmake gcc wget ninja pkg-config
+          brew install llvm create-dmg nasm cmake gcc wget ninja
+          # pkg-config is handled in a separate step, because it may be already installed by `macos-latest`(14.7.1) runner
+          if command -v pkg-config &>/dev/null; then
+              echo "pkg-config is already installed"
+          else
+              brew install pkg-config
+          fi
 
       - name: Install flutter
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
 
       - name: Workaround for flutter issue
         shell: bash
@@ -709,7 +731,7 @@ jobs:
       - name: Restore bridge files
         uses: actions/download-artifact@master
         with:
-          name: bridge-artifact-macos
+          name: bridge-artifact
           path: ./
 
       - name: Setup vcpkg with Github Actions binary cache
@@ -922,6 +944,12 @@ jobs:
         with:
           channel: "stable"
           flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.ANDROID_FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
@@ -1193,6 +1221,11 @@ jobs:
         with:
           channel: "stable"
           flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.ANDROID_FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
 
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -1542,6 +1575,19 @@ jobs:
                 flutter doctor -v
               ;;
             esac
+
+            if [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]]; then
+              case ${{ matrix.job.arch }} in
+                aarch64)
+                  pushd /opt/flutter-elinux/flutter
+                ;;
+                x86_64)
+                  pushd /opt/flutter
+                ;;
+              esac
+              git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+              popd
+            fi
 
             # build flutter
             pushd /workspace
@@ -2012,7 +2058,12 @@ jobs:
         with:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          cache: true
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
 
       # https://rustdesk.com/docs/en/dev/build/web/
       - name: Build web
