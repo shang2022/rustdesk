@@ -118,6 +118,11 @@ pub fn start(args: &mut [String]) {
             Box::new(cm::SciterConnectionManager::new())
         });
         page = "cm.html";
+        *cm::HIDE_CM.lock().unwrap() = crate::ipc::get_config("hide_cm")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            == "true";
     } else if (args[0] == "--connect"
         || args[0] == "--file-transfer"
         || args[0] == "--port-forward"
@@ -178,6 +183,13 @@ pub fn start(args: &mut [String]) {
             .unwrap_or("".to_owned()),
         page
     ));
+    let hide_cm = *cm::HIDE_CM.lock().unwrap();
+    if !args.is_empty() && args[0] == "--cm" && hide_cm {
+        // run_app calls expand(show) + run_loop, we use collapse(hide) + run_loop instead to create a hidden window
+        frame.collapse(true);
+        frame.run_loop();
+        return;
+    }
     frame.run_app();
 }
 
@@ -270,6 +282,18 @@ impl UI {
 
     fn using_public_server(&self) -> bool {
         crate::using_public_server()
+    }
+
+    fn is_incoming_only(&self) -> bool {
+        hbb_common::config::is_incoming_only()
+    }
+
+    pub fn is_outgoing_only(&self) -> bool {
+        hbb_common::config::is_outgoing_only()
+    }
+
+    pub fn is_custom_client(&self) -> bool {
+        crate::common::is_custom_client()
     }
 
     fn get_options(&self) -> Value {
@@ -633,9 +657,9 @@ impl UI {
     pub fn verify2fa(&self, code: String) -> bool {
         verify2fa(code)
     }
-        
+
     fn verify_login(&self, raw: String, id: String) -> bool {
-       crate::verify_login(&raw, &id)
+        crate::verify_login(&raw, &id)
     }
 
     fn generate_2fa_img_src(&self, data: String) -> String {
@@ -659,6 +683,9 @@ impl sciter::EventHandler for UI {
         fn get_api_server();
         fn is_xfce();
         fn using_public_server();
+        fn is_custom_client();
+        fn is_outgoing_only();
+        fn is_incoming_only();
         fn get_id();
         fn temporary_password();
         fn update_temporary_password();

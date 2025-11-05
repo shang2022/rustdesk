@@ -5,22 +5,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use rdev::{Event, EventType::*, KeyCode};
-use std::{
-    collections::HashMap,
-    ffi::c_void,
-    ops::{Deref, DerefMut},
-    str::FromStr,
-    sync::{Arc, Mutex, RwLock},
-    time::SystemTime,
-};
-use uuid::Uuid;
-
+#[cfg(all(target_os = "windows", not(feature = "flutter")))]
+use hbb_common::config::keys;
 #[cfg(not(feature = "flutter"))]
 use hbb_common::fs;
 use hbb_common::{
     allow_err,
-    config::{keys, Config, LocalConfig, PeerConfig},
+    config::{Config, LocalConfig, PeerConfig},
     get_version_number, log,
     message_proto::*,
     rendezvous_proto::ConnType,
@@ -31,6 +22,20 @@ use hbb_common::{
     },
     whoami, Stream,
 };
+use rdev::{Event, EventType::*, KeyCode};
+#[cfg(all(feature = "vram", feature = "flutter"))]
+use std::ffi::c_void;
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+    str::FromStr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    time::SystemTime,
+};
+use uuid::Uuid;
 
 use crate::client::io_loop::Remote;
 use crate::client::{
@@ -59,6 +64,9 @@ pub struct Session<T: InvokeUiSession> {
     pub last_change_display: Arc<Mutex<ChangeDisplayRecord>>,
     pub connection_round_state: Arc<Mutex<ConnectionRoundState>>,
     pub printer_names: Arc<RwLock<HashMap<i32, String>>>,
+    // Indicate whether the session is reconnected.
+    // Used to auto start file transfer after reconnection.
+    pub reconnect_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -192,7 +200,11 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn is_default(&self) -> bool {
-        self.lc.read().unwrap().conn_type.eq(&ConnType::DEFAULT_CONN)
+        self.lc
+            .read()
+            .unwrap()
+            .conn_type
+            .eq(&ConnType::DEFAULT_CONN)
     }
 
     pub fn is_view_camera(&self) -> bool {
@@ -804,7 +816,6 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg_out));
     }
 
-
     pub fn capture_displays(&self, add: Vec<i32>, sub: Vec<i32>, set: Vec<i32>) {
         let mut misc = Misc::new();
         misc.set_capture_displays(CaptureDisplays {
@@ -1267,6 +1278,7 @@ impl<T: InvokeUiSession> Session<T> {
             self.lc.write().unwrap().force_relay = true;
         }
         self.lc.write().unwrap().peer_info = None;
+        self.reconnect_count.fetch_add(1, Ordering::SeqCst);
         let mut lock = self.thread.lock().unwrap();
         // No need to join the previous thread, because it will exit automatically.
         // And the previous thread will not change important states.
@@ -1367,6 +1379,24 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Close);
     }
 
+    fn try_auto_start_job_str(is_reconnected: bool, job_str: &str) -> Option<String> {
+        if is_reconnected {
+            let job_str = job_str.trim();
+            if let Some(stripped) = job_str.strip_suffix('}') {
+                format!(r#"{},"auto_start": true}}"#, stripped).into()
+            } else {
+                // unreachable in normal cases
+                log::warn!(
+                    "The last character is not '}}': {}, auto start is ignored on flutter",
+                    job_str
+                );
+                Some(job_str.to_owned())
+            }
+        } else {
+            None
+        }
+    }
+
     pub fn load_last_jobs(&self) {
         self.clear_all_jobs();
         let pc = self.load_config();
@@ -1374,18 +1404,32 @@ impl<T: InvokeUiSession> Session<T> {
             // no last jobs
             return;
         }
+        let reconnect_count_thr = if cfg!(feature = "flutter") { 0 } else { 1 };
+        let is_reconnected = self.reconnect_count.load(Ordering::SeqCst) > reconnect_count_thr;
         // TODO: can add a confirm dialog
         let mut cnt = 1;
         for job_str in pc.transfer.read_jobs.iter() {
             if !job_str.is_empty() {
-                self.load_last_job(cnt, job_str);
+                self.load_last_job(
+                    cnt,
+                    Self::try_auto_start_job_str(is_reconnected, job_str)
+                        .as_deref()
+                        .unwrap_or(job_str),
+                    is_reconnected,
+                );
                 cnt += 1;
                 log::info!("restore read_job: {:?}", job_str);
             }
         }
         for job_str in pc.transfer.write_jobs.iter() {
             if !job_str.is_empty() {
-                self.load_last_job(cnt, job_str);
+                self.load_last_job(
+                    cnt,
+                    Self::try_auto_start_job_str(is_reconnected, job_str)
+                        .as_deref()
+                        .unwrap_or(job_str),
+                    is_reconnected,
+                );
                 cnt += 1;
                 log::info!("restore write_job: {:?}", job_str);
             }
@@ -1611,14 +1655,14 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn set_permission(&self, name: &str, value: bool);
     fn close_success(&self);
     fn update_quality_status(&self, qs: QualityStatus);
-    fn set_connection_type(&self, is_secured: bool, direct: bool);
+    fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str);
     fn set_fingerprint(&self, fingerprint: String);
     fn job_error(&self, id: i32, err: String, file_num: i32);
     fn job_done(&self, id: i32, file_num: i32);
     fn clear_all_jobs(&self);
     fn new_message(&self, msg: String);
     fn update_transfer_list(&self);
-    fn load_last_job(&self, cnt: i32, job_json: &str);
+    fn load_last_job(&self, cnt: i32, job_json: &str, auto_start: bool);
     fn update_folder_files(
         &self,
         id: i32,

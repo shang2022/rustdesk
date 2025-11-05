@@ -104,7 +104,9 @@ pub enum FS {
         file_size: u64,
         last_modified: u64,
         is_upload: bool,
+        is_resume: bool,
     },
+    SendConfirm(Vec<u8>),
     Rename {
         id: i32,
         path: String,
@@ -175,7 +177,7 @@ pub enum DataPortableService {
     Ping,
     Pong,
     ConnCount(Option<usize>),
-    Mouse((Vec<u8>, i32)),
+    Mouse((Vec<u8>, i32, String, u32, bool, bool)),
     Pointer((Vec<u8>, i32)),
     Key(Vec<u8>),
     RequestStart,
@@ -269,7 +271,7 @@ pub enum Data {
     CheckHwcodec,
     #[cfg(feature = "flutter")]
     VideoConnCount(Option<usize>),
-    // Although the key is not neccessary, it is used to avoid hardcoding the key.
+    // Although the key is not necessary, it is used to avoid hardcoding the key.
     WaylandScreencastRestoreToken((String, String)),
     HwCodecConfig(Option<String>),
     RemoveTrustedDevices(Vec<Bytes>),
@@ -287,6 +289,8 @@ pub enum Data {
     #[cfg(target_os = "windows")]
     PortForwardSessionCount(Option<usize>),
     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    Whiteboard((String, crate::whiteboard::CustomEvent)),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -359,6 +363,8 @@ pub struct CheckIfRestart {
     audio_input: String,
     voice_call_input: String,
     ws: String,
+    disable_udp: String,
+    allow_insecure_tls_fallback: String,
     api_server: String,
 }
 
@@ -370,17 +376,31 @@ impl CheckIfRestart {
             audio_input: Config::get_option("audio-input"),
             voice_call_input: Config::get_option("voice-call-input"),
             ws: Config::get_option(OPTION_ALLOW_WEBSOCKET),
+            disable_udp: Config::get_option(config::keys::OPTION_DISABLE_UDP),
+            allow_insecure_tls_fallback: Config::get_option(
+                config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK,
+            ),
             api_server: Config::get_option("api-server"),
         }
     }
 }
 impl Drop for CheckIfRestart {
     fn drop(&mut self) {
-        if self.stop_service != Config::get_option("stop-service")
+        // If https proxy is used, we need to restart rendezvous mediator.
+        // No need to check if https proxy is used, because this option does not change frequently
+        // and restarting mediator is safe even https proxy is not used.
+        let allow_insecure_tls_fallback_changed = self.allow_insecure_tls_fallback
+            != Config::get_option(config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK);
+        if allow_insecure_tls_fallback_changed
+            || self.stop_service != Config::get_option("stop-service")
             || self.rendezvous_servers != Config::get_rendezvous_servers()
             || self.ws != Config::get_option(OPTION_ALLOW_WEBSOCKET)
+            || self.disable_udp != Config::get_option(config::keys::OPTION_DISABLE_UDP)
             || self.api_server != Config::get_option("api-server")
         {
+            if allow_insecure_tls_fallback_changed {
+                hbb_common::tls::reset_tls_cache();
+            }
             RendezvousMediator::restart();
         }
         if self.audio_input != Config::get_option("audio-input") {

@@ -15,15 +15,15 @@ use hbb_common::{
 };
 use serde::Serialize;
 use serde_json::json;
-
+#[cfg(target_os = "windows")]
+use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
-    io::{Error as IoError, ErrorKind as IoErrorKind},
     os::raw::{c_char, c_int, c_void},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, RwLock,
     },
 };
@@ -111,6 +111,7 @@ pub extern "C" fn rustdesk_core_main() -> bool {
         #[cfg(target_os = "macos")]
         std::process::exit(0);
     }
+    #[cfg(not(target_os = "macos"))]
     false
 }
 
@@ -716,12 +717,13 @@ impl InvokeUiSession for FlutterHandler {
         );
     }
 
-    fn set_connection_type(&self, is_secured: bool, direct: bool) {
+    fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str) {
         self.push_event(
             "connection_ready",
             &[
                 ("secure", &is_secured.to_string()),
                 ("direct", &direct.to_string()),
+                ("stream_type", &stream_type.to_string()),
             ],
             &[],
         );
@@ -754,7 +756,7 @@ impl InvokeUiSession for FlutterHandler {
     // unused in flutter
     fn clear_all_jobs(&self) {}
 
-    fn load_last_job(&self, _cnt: i32, job_json: &str) {
+    fn load_last_job(&self, _cnt: i32, job_json: &str, _auto_start: bool) {
         self.push_event("load_last_job", &[("value", job_json)], &[]);
     }
 
@@ -1119,6 +1121,9 @@ impl InvokeUiSession for FlutterHandler {
                     ("pid", json!(opened.pid)),
                     ("service_id", json!(&opened.service_id)),
                 ];
+                if !opened.persistent_sessions.is_empty() {
+                    event_data.push(("persistent_sessions", json!(opened.persistent_sessions)));
+                }
                 self.push_event_("terminal_response", &event_data, &[], &[]);
             }
             Some(Union::Data(data)) => {
@@ -1323,6 +1328,7 @@ pub fn session_add(
         server_keyboard_enabled: Arc::new(RwLock::new(true)),
         server_file_transfer_enabled: Arc::new(RwLock::new(true)),
         server_clipboard_enabled: Arc::new(RwLock::new(true)),
+        reconnect_count: Arc::new(AtomicUsize::new(0)),
         ..Default::default()
     };
 
@@ -1975,7 +1981,7 @@ pub(super) fn session_update_virtual_display(session: &FlutterSession, index: i3
             let mut vdisplays = displays.split(',').collect::<Vec<_>>();
             let len = vdisplays.len();
             if index == 0 {
-                // 0 means we cann't toggle the virtual display by index.
+                // 0 means we can't toggle the virtual display by index.
                 vdisplays.remove(vdisplays.len() - 1);
             } else {
                 if let Some(i) = vdisplays.iter().position(|&x| x == index.to_string()) {

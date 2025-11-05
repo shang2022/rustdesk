@@ -9,6 +9,7 @@ import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_hbb/common/widgets/peers_view.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
@@ -36,12 +37,14 @@ import 'package:get/get.dart';
 import 'package:uuid/uuid.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:vector_math/vector_math.dart' show Vector2;
 
 import '../common.dart';
 import '../utils/image.dart' as img;
 import '../common/widgets/dialog.dart';
 import 'input_model.dart';
 import 'platform_model.dart';
+import 'package:flutter_hbb/utils/scale.dart';
 
 import 'package:flutter_hbb/generated_bridge.dart'
     if (dart.library.html) 'package:flutter_hbb/web/bridge.dart';
@@ -61,6 +64,7 @@ class CachedPeerData {
 
   bool secure = false;
   bool direct = false;
+  String streamType = '';
 
   CachedPeerData();
 
@@ -74,6 +78,7 @@ class CachedPeerData {
       'permissions': permissions,
       'secure': secure,
       'direct': direct,
+      'streamType': streamType,
     });
   }
 
@@ -92,6 +97,7 @@ class CachedPeerData {
       });
       data.secure = map['secure'];
       data.direct = map['direct'];
+      data.streamType = map['streamType'];
       return data;
     } catch (e) {
       debugPrint('Failed to parse CachedPeerData: $e');
@@ -110,9 +116,11 @@ class FfiModel with ChangeNotifier {
   bool? _secure;
   bool? _direct;
   bool _touchMode = false;
+  late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
   var _reconnects = 1;
   bool _viewOnly = false;
+  bool _showMyCursor = false;
   WeakReference<FFI> parent;
   late final SessionID sessionId;
 
@@ -151,6 +159,7 @@ class FfiModel with ChangeNotifier {
   bool get isPeerMobile => isPeerAndroid;
 
   bool get viewOnly => _viewOnly;
+  bool get showMyCursor => _showMyCursor;
 
   set inputBlocked(v) {
     _inputBlocked = v;
@@ -160,6 +169,7 @@ class FfiModel with ChangeNotifier {
     clear();
     sessionId = parent.target!.sessionId;
     cachedPeerData.permissions = _permissions;
+    virtualMouseMode = VirtualMouseMode(this);
   }
 
   Rect? globalDisplaysRect() => _getDisplaysRect(_pi.displays, true);
@@ -223,27 +233,45 @@ class FfiModel with ChangeNotifier {
     timerScreenshot?.cancel();
   }
 
-  setConnectionType(String peerId, bool secure, bool direct) {
+  setConnectionType(
+      String peerId, bool secure, bool direct, String streamType) {
     cachedPeerData.secure = secure;
     cachedPeerData.direct = direct;
+    cachedPeerData.streamType = streamType;
     _secure = secure;
     _direct = direct;
     try {
       var connectionType = ConnectionTypeState.find(peerId);
       connectionType.setSecure(secure);
       connectionType.setDirect(direct);
+      connectionType.setStreamType(streamType);
     } catch (e) {
       //
     }
   }
 
-  Widget? getConnectionImage() {
+  Widget? getConnectionImageText() {
     if (secure == null || direct == null) {
       return null;
     } else {
       final icon =
           '${secure == true ? 'secure' : 'insecure'}${direct == true ? '' : '_relay'}';
-      return SvgPicture.asset('assets/$icon.svg', width: 48, height: 48);
+      final iconWidget =
+          SvgPicture.asset('assets/$icon.svg', width: 48, height: 48);
+      String connectionText =
+          getConnectionText(secure!, direct!, cachedPeerData.streamType);
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          iconWidget,
+          SizedBox(height: 4),
+          Text(
+            connectionText,
+            style: TextStyle(fontSize: 12),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      );
     }
   }
 
@@ -260,7 +288,7 @@ class FfiModel with ChangeNotifier {
       'link': '',
     }, sessionId, peerId);
     updatePrivacyMode(data.updatePrivacyMode, sessionId, peerId);
-    setConnectionType(peerId, data.secure, data.direct);
+    setConnectionType(peerId, data.secure, data.direct, data.streamType);
     await handlePeerInfo(data.peerInfo, peerId, true);
     for (final element in data.cursorDataList) {
       updateLastCursorId(element);
@@ -289,8 +317,8 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'sync_platform_additions') {
         handlePlatformAdditions(evt, sessionId, peerId);
       } else if (name == 'connection_ready') {
-        setConnectionType(
-            peerId, evt['secure'] == 'true', evt['direct'] == 'true');
+        setConnectionType(peerId, evt['secure'] == 'true',
+            evt['direct'] == 'true', evt['stream_type'] ?? '');
       } else if (name == 'switch_display') {
         // switch display is kept for backward compatibility
         handleSwitchDisplay(evt, sessionId, peerId);
@@ -836,10 +864,16 @@ class FfiModel with ChangeNotifier {
     } else if (type == 'input-password') {
       enterPasswordDialog(sessionId, dialogManager);
     } else if (type == 'session-login' || type == 'session-re-login') {
-      enterUserLoginDialog(sessionId, dialogManager);
-    } else if (type == 'session-login-password' ||
-        type == 'session-login-password') {
-      enterUserLoginAndPasswordDialog(sessionId, dialogManager);
+      enterUserLoginDialog(sessionId, dialogManager, 'login_linux_tip', true);
+    } else if (type == 'session-login-password') {
+      enterUserLoginAndPasswordDialog(
+          sessionId, dialogManager, 'login_linux_tip', true);
+    } else if (type == 'terminal-admin-login') {
+      enterUserLoginDialog(
+          sessionId, dialogManager, 'terminal-admin-login-tip', false);
+    } else if (type == 'terminal-admin-login-password') {
+      enterUserLoginAndPasswordDialog(
+          sessionId, dialogManager, 'terminal-admin-login-tip', false);
     } else if (type == 'restarting') {
       showMsgBox(sessionId, type, title, text, link, false, dialogManager,
           hasCancel: false);
@@ -1075,9 +1109,23 @@ class FfiModel with ChangeNotifier {
     if (isPeerAndroid) {
       _touchMode = true;
     } else {
-      _touchMode = await bind.sessionGetOption(
-              sessionId: sessionId, arg: kOptionTouchMode) !=
-          '';
+      // `kOptionTouchMode` is originally peer option, but it is moved to local option later.
+      // We check local option first, if not set, then check peer option.
+      // Because if local option is not empty:
+      // 1. User has set the touch mode explicitly.
+      // 2. The advanced option (custom client) is set.
+      //    Then we choose to use the local option.
+      final optLocal = bind.mainGetLocalOption(key: kOptionTouchMode);
+      if (optLocal != '') {
+        _touchMode = optLocal == 'Y';
+      } else {
+        final optSession = await bind.sessionGetOption(
+            sessionId: sessionId, arg: kOptionTouchMode);
+        _touchMode = optSession != '';
+      }
+    }
+    if (isMobile) {
+      virtualMouseMode.loadOptions();
     }
     if (connType == ConnType.fileTransfer) {
       parent.target?.fileModel.onReady();
@@ -1117,6 +1165,8 @@ class FfiModel with ChangeNotifier {
           peerId,
           bind.sessionGetToggleOptionSync(
               sessionId: sessionId, arg: kOptionToggleViewOnly));
+      setShowMyCursor(bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: kOptionToggleShowMyCursor));
     }
     if (connType == ConnType.defaultConn || connType == ConnType.viewCamera) {
       final platformAdditions = evt['platform_additions'];
@@ -1467,6 +1517,79 @@ class FfiModel with ChangeNotifier {
       notifyListeners();
     }
   }
+
+  void setShowMyCursor(bool value) {
+    if (_showMyCursor != value) {
+      _showMyCursor = value;
+      notifyListeners();
+    }
+  }
+}
+
+class VirtualMouseMode with ChangeNotifier {
+  bool _showVirtualMouse = false;
+  double _virtualMouseScale = 1.0;
+  bool _showVirtualJoystick = false;
+
+  bool get showVirtualMouse => _showVirtualMouse;
+  double get virtualMouseScale => _virtualMouseScale;
+  bool get showVirtualJoystick => _showVirtualJoystick;
+
+  FfiModel ffiModel;
+
+  VirtualMouseMode(this.ffiModel);
+
+  bool _shouldShow() => !ffiModel.isPeerAndroid;
+
+  setShowVirtualMouse(bool b) {
+    if (b == _showVirtualMouse) return;
+    if (_shouldShow()) {
+      _showVirtualMouse = b;
+      notifyListeners();
+    }
+  }
+
+  setVirtualMouseScale(double s) {
+    if (s <= 0) return;
+    if (s == _virtualMouseScale) return;
+    _virtualMouseScale = s;
+    bind.mainSetLocalOption(key: kOptionVirtualMouseScale, value: s.toString());
+    notifyListeners();
+  }
+
+  setShowVirtualJoystick(bool b) {
+    if (b == _showVirtualJoystick) return;
+    if (_shouldShow()) {
+      _showVirtualJoystick = b;
+      notifyListeners();
+    }
+  }
+
+  void loadOptions() {
+    _showVirtualMouse =
+        bind.mainGetLocalOption(key: kOptionShowVirtualMouse) == 'Y';
+    _virtualMouseScale = double.tryParse(
+            bind.mainGetLocalOption(key: kOptionVirtualMouseScale)) ??
+        1.0;
+    _showVirtualJoystick =
+        bind.mainGetLocalOption(key: kOptionShowVirtualJoystick) == 'Y';
+    notifyListeners();
+  }
+
+  Future<void> toggleVirtualMouse() async {
+    await bind.mainSetLocalOption(
+        key: kOptionShowVirtualMouse, value: showVirtualMouse ? 'N' : 'Y');
+    setShowVirtualMouse(
+        bind.mainGetLocalOption(key: kOptionShowVirtualMouse) == 'Y');
+  }
+
+  Future<void> toggleVirtualJoystick() async {
+    await bind.mainSetLocalOption(
+        key: kOptionShowVirtualJoystick,
+        value: showVirtualJoystick ? 'N' : 'Y');
+    setShowVirtualJoystick(
+        bind.mainGetLocalOption(key: kOptionShowVirtualJoystick) == 'Y');
+  }
 }
 
 class ImageModel with ChangeNotifier {
@@ -1592,8 +1715,56 @@ class ImageModel with ChangeNotifier {
 }
 
 enum ScrollStyle {
-  scrollbar,
-  scrollauto,
+  scrollbar(kRemoteScrollStyleBar),
+  scrollauto(kRemoteScrollStyleAuto),
+  scrolledge(kRemoteScrollStyleEdge);
+
+  const ScrollStyle(this.stringValue);
+
+  final String stringValue;
+
+  String toJson() {
+    return name;
+  }
+
+  static ScrollStyle fromJson(String json, [ScrollStyle? fallbackValue]) {
+    switch (json) {
+      case 'scrollbar':
+        return scrollbar;
+      case 'scrollauto':
+        return scrollauto;
+      case 'scrolledge':
+        return scrolledge;
+    }
+
+    if (fallbackValue != null) {
+      return fallbackValue;
+    }
+
+    throw ArgumentError("Unknown ScrollStyle JSON value: '$json'");
+  }
+
+  @override
+  String toString() {
+    return stringValue;
+  }
+
+  static ScrollStyle fromString(String string, [ScrollStyle? fallbackValue]) {
+    switch (string) {
+      case kRemoteScrollStyleBar:
+        return scrollbar;
+      case kRemoteScrollStyleAuto:
+        return scrollauto;
+      case kRemoteScrollStyleEdge:
+        return scrolledge;
+    }
+
+    if (fallbackValue != null) {
+      return fallbackValue;
+    }
+
+    throw ArgumentError("Unknown ScrollStyle string value: '$string'");
+  }
 }
 
 class ViewStyle {
@@ -1661,8 +1832,64 @@ class ViewStyle {
         final s2 = height / displayHeight;
         s = s1 < s2 ? s1 : s2;
       }
+    } else if (style == kRemoteViewStyleCustom) {
+      // Custom scale is session-scoped and applied in CanvasModel.updateViewStyle()
     }
     return s;
+  }
+}
+
+enum EdgeScrollState {
+  inactive,
+  armed,
+  active,
+}
+
+class EdgeScrollFallbackState {
+  final CanvasModel _owner;
+
+  late Ticker _ticker;
+
+  Duration _lastTotalElapsed = Duration.zero;
+  bool _nextEventIsFirst = true;
+  Vector2 _encroachment = Vector2.zero();
+
+  EdgeScrollFallbackState(this._owner, TickerProvider tickerProvider) {
+    _ticker = tickerProvider.createTicker(emitTick);
+  }
+
+  void setEncroachment(Vector2 encroachment) {
+    _encroachment = encroachment;
+  }
+
+  void emitTick(Duration totalElapsed) {
+    if (_nextEventIsFirst) {
+      _lastTotalElapsed = totalElapsed;
+      _nextEventIsFirst = false;
+    } else {
+      final thisTickElapsed = totalElapsed - _lastTotalElapsed;
+
+      const double kFrameTime = 1000.0 / 60.0;
+      const double kSpeedFactor = 0.1;
+
+      var delta = _encroachment *
+          (kSpeedFactor * thisTickElapsed.inMilliseconds / kFrameTime);
+
+      _owner.performEdgeScroll(delta);
+
+      _lastTotalElapsed = totalElapsed;
+    }
+  }
+
+  void start() {
+    if (!_ticker.isActive) {
+      _nextEventIsFirst = true;
+      _ticker.start();
+    }
+  }
+
+  void stop() {
+    _ticker.stop();
   }
 }
 
@@ -1687,6 +1914,13 @@ class CanvasModel with ChangeNotifier {
   // scroll offset y percent
   double _scrollY = 0.0;
   ScrollStyle _scrollStyle = ScrollStyle.scrollauto;
+  // tracks whether edge scroll should be active, prevents spurious
+  // scrolling when the cursor enters the view from outside
+  EdgeScrollState _edgeScrollState = EdgeScrollState.inactive;
+  // fallback strategy for when Bump Mouse isn't available
+  late EdgeScrollFallbackState _edgeScrollFallbackState;
+  // to avoid hammering a non-functional Bump Mouse
+  bool _bumpMouseIsWorking = true;
   ViewStyle _lastViewStyle = ViewStyle.defaultViewStyle();
 
   Timer? _timerMobileFocusCanvasCursor;
@@ -1717,9 +1951,18 @@ class CanvasModel with ChangeNotifier {
 
   _resetScroll() => setScrollPercent(0.0, 0.0);
 
-  setScrollPercent(double x, double y) {
-    _scrollX = x;
-    _scrollY = y;
+  void setScrollPercent(double x, double y) {
+    _scrollX = x.isFinite ? x : 0.0;
+    _scrollY = y.isFinite ? y : 0.0;
+  }
+
+  void pushScrollPositionToUI(double scrollPixelX, double scrollPixelY) {
+    if (_horizontal.hasClients) {
+      _horizontal.jumpTo(scrollPixelX);
+    }
+    if (_vertical.hasClients) {
+      _vertical.jumpTo(scrollPixelY);
+    }
   }
 
   ScrollController get scrollHorizontal => _horizontal;
@@ -1777,7 +2020,13 @@ class CanvasModel with ChangeNotifier {
       displayWidth: displayWidth,
       displayHeight: displayHeight,
     );
-    if (_lastViewStyle == viewStyle) {
+    // If only the Custom scale percent changed, proceed to update even if
+    // the basic ViewStyle fields are equal.
+    // In Custom scale mode, the scale percent can change independently of the other
+    // ViewStyle fields and is not captured by the equality check. Therefore, we must
+    // allow updates to proceed when style == kRemoteViewStyleCustom, even if the
+    // rest of the ViewStyle fields are unchanged.
+    if (_lastViewStyle == viewStyle && style != kRemoteViewStyleCustom) {
       return;
     }
     if (_lastViewStyle.style != viewStyle.style) {
@@ -1786,12 +2035,30 @@ class CanvasModel with ChangeNotifier {
     _lastViewStyle = viewStyle;
     _scale = viewStyle.scale;
 
+    // Apply custom scale percent when in Custom mode
+    if (style == kRemoteViewStyleCustom) {
+      try {
+        _scale = await getSessionCustomScale(sessionId);
+      } catch (e, stack) {
+        debugPrint('Error in getSessionCustomScale: $e');
+        debugPrintStack(stackTrace: stack);
+        _scale = 1.0;
+      }
+    }
+
     _devicePixelRatio = ui.window.devicePixelRatio;
-    if (kIgnoreDpi && style == kRemoteViewStyleOriginal) {
-      _scale = 1.0 / _devicePixelRatio;
+    if (kIgnoreDpi) {
+      if (style == kRemoteViewStyleOriginal) {
+        _scale = 1.0 / _devicePixelRatio;
+      } else if (_scale != 0 && style == kRemoteViewStyleCustom) {
+        _scale /= _devicePixelRatio;
+      }
     }
     _resetCanvasOffset(displayWidth, displayHeight);
-    _imageOverflow.value = _x < 0 || y < 0;
+    final overflow = _x < 0 || y < 0;
+    if (_imageOverflow.value != overflow) {
+      _imageOverflow.value = overflow;
+    }
     if (notify) {
       notifyListeners();
     }
@@ -1810,13 +2077,14 @@ class CanvasModel with ChangeNotifier {
   }
 
   tryUpdateScrollStyle(Duration duration, String? style) async {
-    if (_scrollStyle != ScrollStyle.scrollbar) return;
+    if (_scrollStyle == ScrollStyle.scrollauto) return;
     style ??= await bind.sessionGetViewStyle(sessionId: sessionId);
-    if (style != kRemoteViewStyleOriginal) {
+    if (style != kRemoteViewStyleOriginal && style != kRemoteViewStyleCustom) {
       return;
     }
 
     _resetScroll();
+
     Future.delayed(duration, () async {
       updateScrollPercent();
     });
@@ -1824,12 +2092,15 @@ class CanvasModel with ChangeNotifier {
 
   updateScrollStyle() async {
     final style = await bind.sessionGetScrollStyle(sessionId: sessionId);
-    if (style == kRemoteScrollStyleBar) {
-      _scrollStyle = ScrollStyle.scrollbar;
+
+    _scrollStyle = style != null
+        ? ScrollStyle.fromString(style!)
+        : ScrollStyle.scrollauto;
+
+    if (_scrollStyle != ScrollStyle.scrollauto) {
       _resetScroll();
-    } else {
-      _scrollStyle = ScrollStyle.scrollauto;
     }
+
     notifyListeners();
   }
 
@@ -1860,7 +2131,33 @@ class CanvasModel with ChangeNotifier {
   static double get windowBorderWidth => stateGlobal.windowBorderWidth.value;
   static double get tabBarHeight => stateGlobal.tabBarHeight;
 
-  moveDesktopMouse(double x, double y) {
+  void activateLocalCursor() {
+    if (isDesktop || isWebDesktop) {
+      try {
+        RemoteCursorMovedState.find(id).value = false;
+      } catch (e) {
+        //
+      }
+    }
+  }
+
+  void updateLocalCursor(double x, double y) {
+    // If keyboard is not permitted, do not move cursor when mouse is moving.
+    if (parent.target != null && parent.target!.ffiModel.keyboard) {
+      // Draw cursor if is not desktop.
+      if (!(isDesktop || isWebDesktop)) {
+        parent.target!.cursorModel.moveLocal(x, y);
+      } else {
+        try {
+          RemoteCursorMovedState.find(id).value = false;
+        } catch (e) {
+          //
+        }
+      }
+    }
+  }
+
+  void moveDesktopMouse(double x, double y) {
     if (size.width == 0 || size.height == 0) {
       return;
     }
@@ -1889,20 +2186,132 @@ class CanvasModel with ChangeNotifier {
     if (dxOffset != 0 || dyOffset != 0) {
       notifyListeners();
     }
+  }
 
-    // If keyboard is not permitted, do not move cursor when mouse is moving.
-    if (parent.target != null && parent.target!.ffiModel.keyboard) {
-      // Draw cursor if is not desktop.
-      if (!(isDesktop || isWebDesktop)) {
-        parent.target!.cursorModel.moveLocal(x, y);
+  void initializeEdgeScrollFallback(TickerProvider tickerProvider) {
+    _edgeScrollFallbackState = EdgeScrollFallbackState(this, tickerProvider);
+  }
+
+  void disableEdgeScroll() {
+    _edgeScrollState = EdgeScrollState.inactive;
+    cancelEdgeScroll();
+  }
+
+  void rearmEdgeScroll() {
+    _edgeScrollState = EdgeScrollState.armed;
+  }
+
+  void cancelEdgeScroll() {
+    _edgeScrollFallbackState.stop();
+  }
+
+  (Vector2, Vector2) getScrollInfo() {
+    final scrollPixel = Vector2(
+      _horizontal.hasClients ? _horizontal.position.pixels : 0,
+      _vertical.hasClients ? _vertical.position.pixels : 0);
+
+    final max = Vector2(
+      _horizontal.hasClients ? _horizontal.position.maxScrollExtent : 0,
+      _vertical.hasClients ? _vertical.position.maxScrollExtent : 0);
+
+    return (scrollPixel, max);
+  }
+
+  void edgeScrollMouse(double x, double y) async {
+    if ((_edgeScrollState == EdgeScrollState.inactive) ||
+        (size.width == 0 || size.height == 0) ||
+        !(_horizontal.hasClients || _vertical.hasClients)) {
+      return;
+    }
+
+    // Trigger scrolling when the cursor is close to an edge
+    const double edgeThickness = 100;
+
+    if (_edgeScrollState == EdgeScrollState.armed) {
+      // Edge scroll is armed to become active once the cursor
+      // is observed within the rectangle interior to the
+      // edge scroll regions. If the user has just moved the
+      // cursor in from outside of the window, edge scrolling
+      // doesn't happen yet.
+      final clientArea = Rect.fromLTWH(0, 0, size.width, size.height);
+
+      final innerZone = clientArea.deflate(edgeThickness);
+
+      if (innerZone.contains(Offset(x, y))) {
+        _edgeScrollState = EdgeScrollState.active;
       } else {
-        try {
-          RemoteCursorMovedState.find(id).value = false;
-        } catch (e) {
-          //
-        }
+        // Not yet.
+        return;
       }
     }
+
+    var dxOffset = 0.0;
+    var dyOffset = 0.0;
+
+    if (x < edgeThickness) {
+      dxOffset = x - edgeThickness;
+    } else if (x >= size.width - edgeThickness) {
+      dxOffset = x - (size.width - edgeThickness);
+    }
+
+    if (y < edgeThickness) {
+      dyOffset = y - edgeThickness;
+    } else if (y >= size.height - edgeThickness) {
+      dyOffset = y - (size.height - edgeThickness);
+    }
+
+    var encroachment = Vector2(dxOffset, dyOffset);
+
+    var (scrollPixel, max) = getScrollInfo();
+
+    encroachment.clamp(-scrollPixel, max - scrollPixel);
+
+    if (encroachment.length2 == 0) {
+      _edgeScrollFallbackState.stop();
+    } else {
+      var bumpAmount = -encroachment;
+
+      // Round away from 0: this ensures that the mouse will be bumped clear of
+      // whichever edge scroll zone(s) it is in
+      bumpAmount.x += bumpAmount.x.sign * 0.5;
+      bumpAmount.y += bumpAmount.y.sign * 0.5;
+
+      var bumpMouseSucceeded = _bumpMouseIsWorking &&
+          (await rustDeskWinManager.call(WindowType.Main, kWindowBumpMouse,
+                  {"dx": bumpAmount.x.round(), "dy": bumpAmount.y.round()}))
+              .result;
+
+      if (bumpMouseSucceeded) {
+        performEdgeScroll(encroachment);
+      } else {
+        // If we can't BumpMouse, then we switch to slower scrolling with autorepeat
+
+        // Don't keep hammering BumpMouse if it's not working.
+        _bumpMouseIsWorking = false;
+
+        // Keep scrolling as long as the user is overtop of an edge.
+        _edgeScrollFallbackState.setEncroachment(encroachment);
+        _edgeScrollFallbackState.start();
+      }
+    }
+  }
+
+  void performEdgeScroll(Vector2 delta) {
+    var (scrollPixel, max) = getScrollInfo();
+
+    scrollPixel += delta;
+
+    scrollPixel.clamp(Vector2.zero(), max);
+
+    var scrollPixelPercent = scrollPixel.clone();
+
+    scrollPixelPercent.divide(max);
+    scrollPixelPercent.scale(100.0);
+
+    setScrollPercent(scrollPixelPercent.x, scrollPixelPercent.y);
+    pushScrollPositionToUI(scrollPixel.x, scrollPixel.y);
+
+    notifyListeners();
   }
 
   set scale(v) {
@@ -2228,9 +2637,25 @@ class CursorModel with ChangeNotifier {
 
   Rect? get keyHelpToolsRectToAdjustCanvas =>
       _lastKeyboardIsVisible ? _keyHelpToolsRect : null;
-  keyHelpToolsVisibilityChanged(Rect? r, bool keyboardIsVisible) {
-    _keyHelpToolsRect = r;
-    if (r == null) {
+  // The blocked rect is used to block the pointer/touch events in the remote page.
+  final List<Rect> _blockedRects = [];
+  // Used in shouldBlock().
+  // _blockEvents is a flag to block pointer/touch events on the remote image.
+  // It is set to true to prevent accidental touch events in the following scenarios:
+  //   1. In floating mouse mode, when the scroll circle is shown.
+  //   2. In floating mouse widgets mode, when the left/right buttons are moving.
+  //   3. In floating mouse widgets mode, when using the virtual joystick.
+  // When _blockEvents is true, all pointer/touch events are blocked regardless of the contents of _blockedRects.
+  // _blockedRects contains specific rectangular regions where events are blocked; these are checked when _blockEvents is false.
+  // In summary: _blockEvents acts as a global block, while _blockedRects provides fine-grained blocking.
+  bool _blockEvents = false;
+  List<Rect> get blockedRects => List.unmodifiable(_blockedRects);
+
+  set blockEvents(bool v) => _blockEvents = v;
+
+  keyHelpToolsVisibilityChanged(Rect? rect, bool keyboardIsVisible) {
+    _keyHelpToolsRect = rect;
+    if (rect == null) {
       _lastIsBlocked = false;
     } else {
       // Block the touch event is safe here.
@@ -2243,6 +2668,14 @@ class CursorModel with ChangeNotifier {
       parent.target?.canvasModel.isMobileCanvasChanged = false;
     }
     _lastKeyboardIsVisible = keyboardIsVisible;
+  }
+
+  addBlockedRect(Rect rect) {
+    _blockedRects.add(rect);
+  }
+
+  removeBlockedRect(Rect rect) {
+    _blockedRects.remove(rect);
   }
 
   get lastIsBlocked => _lastIsBlocked;
@@ -2311,13 +2744,22 @@ class CursorModel with ChangeNotifier {
 
   // mobile Soft keyboard, block touch event from the KeyHelpTools
   shouldBlock(double x, double y) {
+    if (_blockEvents) {
+      return true;
+    }
+    final offset = Offset(x, y);
+    for (final rect in _blockedRects) {
+      if (isPointInRect(offset, rect)) {
+        return true;
+      }
+    }
+
+    // For help tools rectangle, only block touch event when in touch mode.
     if (!(parent.target?.ffiModel.touchMode ?? false)) {
       return false;
     }
-    if (_keyHelpToolsRect == null) {
-      return false;
-    }
-    if (isPointInRect(Offset(x, y), _keyHelpToolsRect!)) {
+    if (_keyHelpToolsRect != null &&
+        isPointInRect(offset, _keyHelpToolsRect!)) {
       return true;
     }
     return false;
@@ -2335,6 +2777,10 @@ class CursorModel with ChangeNotifier {
     }
     await parent.target?.inputModel.moveMouse(_x, _y);
     return true;
+  }
+
+  Future<void> syncCursorPosition() async {
+    await parent.target?.inputModel.moveMouse(_x, _y);
   }
 
   bool isInRemoteRect(Offset offset) {
@@ -3208,7 +3654,7 @@ class FFI {
   }
 
   void routeTerminalResponse(Map<String, dynamic> evt) {
-    final int terminalId = evt['terminal_id'] ?? 0;
+    final int terminalId = TerminalModel.getTerminalIdFromEvt(evt);
 
     // Route to specific terminal model if it exists
     final model = _terminalModels[terminalId];

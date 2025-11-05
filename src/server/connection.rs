@@ -50,12 +50,16 @@ use serde_json::{json, value::Value};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::Ordering;
 use std::{
+    net::Ipv6Addr,
     num::NonZeroI64,
     path::PathBuf,
+    str::FromStr,
     sync::{atomic::AtomicI64, mpsc as std_mpsc},
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use system_shutdown;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
 #[cfg(windows)]
 use crate::virtual_display_manager;
@@ -124,9 +128,18 @@ pub struct ConnInner {
     tx_video: Option<Sender>,
 }
 
+struct InputMouse {
+    msg: MouseEvent,
+    conn_id: i32,
+    username: String,
+    argb: u32,
+    simulate: bool,
+    show_cursor: bool,
+}
+
 enum MessageInput {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    Mouse((MouseEvent, i32)),
+    Mouse(InputMouse),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Key((KeyEvent, bool)),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -172,6 +185,24 @@ pub enum AuthConnType {
     Terminal,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Clone, Debug)]
+enum TerminalUserToken {
+    SelfUser,
+    #[cfg(target_os = "windows")]
+    CurrentLogonUser(crate::terminal_service::UserToken),
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl TerminalUserToken {
+    fn to_terminal_service_token(&self) -> Option<crate::terminal_service::UserToken> {
+        match self {
+            TerminalUserToken::SelfUser => None,
+            #[cfg(target_os = "windows")]
+            TerminalUserToken::CurrentLogonUser(token) => Some(*token),
+        }
+    }
+}
 pub struct Connection {
     inner: ConnInner,
     display_idx: usize,
@@ -205,6 +236,9 @@ pub struct Connection {
     // by peer
     disable_keyboard: bool,
     // by peer
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    show_my_cursor: bool,
+    // by peer
     disable_clipboard: bool,
     // by peer
     disable_audio: bool,
@@ -220,6 +254,7 @@ pub struct Connection {
     server_audit_conn: String,
     server_audit_file: String,
     lr: LoginRequest,
+    peer_argb: u32,
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
     file_transferred: bool,
@@ -254,6 +289,11 @@ pub struct Connection {
     tx_post_seq: mpsc::UnboundedSender<(String, Value)>,
     terminal_service_id: String,
     terminal_persistent: bool,
+    // The user token must be set when terminal is enabled.
+    // 0 indicates SYSTEM user
+    // other values indicate current user
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    terminal_user_token: Option<TerminalUserToken>,
     terminal_generic_service: Option<Box<GenericService>>,
 }
 
@@ -378,11 +418,14 @@ impl Connection {
             enable_file_transfer: false,
             disable_clipboard: false,
             disable_keyboard: false,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            show_my_cursor: false,
             tx_input,
             video_ack_required: false,
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
             lr: Default::default(),
+            peer_argb: 0u32,
             session_last_recv_time: None,
             chat_unanswered: false,
             file_transferred: false,
@@ -418,6 +461,8 @@ impl Connection {
             tx_post_seq,
             terminal_service_id: "".to_owned(),
             terminal_persistent: false,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            terminal_user_token: None,
             terminal_generic_service: None,
         };
         let addr = hbb_common::try_into_v4(addr);
@@ -606,7 +651,25 @@ impl Connection {
                         }
                         #[cfg(target_os = "windows")]
                         ipc::Data::ClipboardFile(clip) => {
-                            allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                            if !conn.is_remote() {
+                                continue;
+                            }
+                            match clip {
+                                clipboard::ClipboardFile::Files { files } => {
+                                    let files = files.into_iter().map(|(f, s)| {
+                                        (f, s as i64)
+                                    }).collect::<Vec<_>>();
+                                    conn.post_file_audit(
+                                        FileAuditType::RemoteSend,
+                                        "",
+                                        files,
+                                        json!({}),
+                                    );
+                                }
+                                _ => {
+                                    allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                                }
+                            }
                         }
                         ipc::Data::PrivacyModeState((_, state, impl_key)) => {
                             let msg_out = match state {
@@ -713,7 +776,9 @@ impl Connection {
                 }
                 Some((instant, value)) = rx_video.recv() => {
                     if !conn.video_ack_required {
-                        video_service::notify_video_frame_fetched(id, Some(instant.into()));
+                        if let Some(message::Union::VideoFrame(vf)) = &value.union {
+                            video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
+                        }
                     }
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
@@ -861,7 +926,7 @@ impl Connection {
             crate::plugin::EVENT_ON_CONN_CLOSE_SERVER.to_owned(),
             conn.lr.my_id.clone(),
         );
-        video_service::notify_video_frame_fetched(id, None);
+        video_service::notify_video_frame_fetched_by_conn_id(id, None);
         if conn.authorized {
             password::update_temporary_password();
         }
@@ -896,8 +961,15 @@ impl Connection {
         loop {
             match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(v) => match v {
-                    MessageInput::Mouse((msg, id)) => {
-                        handle_mouse(&msg, id);
+                    MessageInput::Mouse(mouse_input) => {
+                        handle_mouse(
+                            &mouse_input.msg,
+                            mouse_input.conn_id,
+                            mouse_input.username,
+                            mouse_input.argb,
+                            mouse_input.simulate,
+                            mouse_input.show_cursor,
+                        );
                     }
                     MessageInput::Key((mut msg, press)) => {
                         // Set the press state to false, use `down` only in `handle_key()`.
@@ -1293,7 +1365,7 @@ impl Connection {
 
         #[cfg(not(target_os = "android"))]
         {
-            pi.hostname = hbb_common::whoami::hostname();
+            pi.hostname = crate::whoami_hostname();
             pi.platform = hbb_common::whoami::platform().to_string();
         }
         #[cfg(target_os = "android")]
@@ -1415,12 +1487,19 @@ impl Connection {
             .unwrap()
             .insert(self.lr.my_id.clone(), self.tx_input.clone());
 
+        // Terminal feature is supported on desktop only
+        #[allow(unused_mut)]
+        let mut terminal = cfg!(not(any(target_os = "android", target_os = "ios")));
+        #[cfg(target_os = "windows")]
+        {
+            terminal = terminal && portable_pty::win::check_support().is_ok();
+        }
         pi.username = username;
         pi.sas_enabled = sas_enabled;
         pi.features = Some(Features {
             privacy_mode: privacy_mode::is_privacy_mode_supported(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            terminal: true, // Terminal feature is supported on desktop only
+            terminal,
             ..Default::default()
         })
         .into();
@@ -1429,7 +1508,9 @@ impl Connection {
         #[allow(unused_mut)]
         let mut wait_session_id_confirm = false;
         #[cfg(windows)]
-        self.handle_windows_specific_session(&mut pi, &mut wait_session_id_confirm);
+        if !self.terminal {
+            self.handle_windows_specific_session(&mut pi, &mut wait_session_id_confirm);
+        }
         if self.file_transfer.is_some() || self.terminal {
             res.set_peer_info(pi);
         } else if self.view_camera {
@@ -1733,8 +1814,25 @@ impl Connection {
 
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn input_mouse(&self, msg: MouseEvent, conn_id: i32) {
-        self.tx_input.send(MessageInput::Mouse((msg, conn_id))).ok();
+    fn input_mouse(
+        &self,
+        msg: MouseEvent,
+        conn_id: i32,
+        username: String,
+        argb: u32,
+        simulate: bool,
+        show_cursor: bool,
+    ) {
+        self.tx_input
+            .send(MessageInput::Mouse(InputMouse {
+                msg,
+                conn_id,
+                username,
+                argb,
+                simulate,
+                show_cursor,
+            }))
+            .ok();
     }
 
     #[inline]
@@ -1849,6 +1947,7 @@ impl Connection {
 
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
         self.lr = lr.clone();
+        self.peer_argb = crate::str2color(&format!("{}{}", &lr.my_id, &lr.my_platform), 0xff);
         if let Some(o) = lr.option.as_ref() {
             self.options_in_login = Some(o.clone());
         }
@@ -1903,6 +2002,16 @@ impl Connection {
     }
 
     async fn on_message(&mut self, msg: Message) -> bool {
+        if let Some(message::Union::Misc(misc)) = &msg.union {
+            // Move the CloseReason forward, as this message needs to be received when unauthorized, especially for kcp.
+            if let Some(misc::Union::CloseReason(s)) = &misc.union {
+                log::info!("receive close reason: {}", s);
+                self.on_close("Peer close", true).await;
+                raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
+                return false;
+            }
+        }
+        // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
@@ -1933,12 +2042,47 @@ impl Connection {
                         sleep(1.).await;
                         return false;
                     }
+                    #[cfg(target_os = "windows")]
+                    if !lr.os_login.username.is_empty() && !crate::platform::is_installed() {
+                        self.send_login_error("Supported only in the installed version.")
+                            .await;
+                        sleep(1.).await;
+                        return false;
+                    }
+
                     self.terminal = true;
                     if let Some(o) = self.options_in_login.as_ref() {
                         self.terminal_persistent =
                             o.terminal_persistent.enum_value() == Ok(BoolOption::Yes);
                     }
                     self.terminal_service_id = terminal.service_id;
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if let Some(msg) =
+                        self.fill_terminal_user_token(&lr.os_login.username, &lr.os_login.password)
+                    {
+                        self.send_login_error(msg).await;
+                        sleep(1.).await;
+                        return false;
+                    }
+
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if let Some(is_user) =
+                        terminal_service::is_service_specified_user(&self.terminal_service_id)
+                    {
+                        if let Some(user_token) = &self.terminal_user_token {
+                            let has_service_token =
+                                user_token.to_terminal_service_token().is_some();
+                            if is_user != has_service_token {
+                                // This occurs when the service id (in the configuration) is manually changed by the user, causing a mismatch in validation.
+                                log::error!("Terminal service user mismatch detected. The service ID may have been manually changed in the configuration, causing validation to fail.");
+                                // No need to translate the following message, because it is in an abnormal case.
+                                self.send_login_error("Terminal service user mismatch detected.")
+                                    .await;
+                                sleep(1.).await;
+                                return false;
+                            }
+                        }
+                    }
                 }
                 Some(login_request::Union::PortForward(mut pf)) => {
                     if !Connection::permission("enable-tunnel") {
@@ -2183,7 +2327,25 @@ impl Connection {
                         }
                         #[cfg(target_os = "macos")]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
-                        self.input_mouse(me, self.inner.id());
+                        self.input_mouse(
+                            me,
+                            self.inner.id(),
+                            self.lr.my_name.clone(),
+                            self.peer_argb,
+                            true,
+                            self.show_my_cursor,
+                        );
+                    } else if self.show_my_cursor {
+                        #[cfg(target_os = "macos")]
+                        self.retina.on_mouse_event(&mut me, self.display_idx);
+                        self.input_mouse(
+                            me,
+                            self.inner.id(),
+                            self.lr.my_name.clone(),
+                            self.peer_argb,
+                            false,
+                            true,
+                        );
                     }
                     self.update_auto_disconnect_timer();
                 }
@@ -2382,14 +2544,25 @@ impl Connection {
                 }
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 Some(message::Union::Cliprdr(clip)) => {
-                    if let Some(clip) = msg_2_clip(clip) {
+                    if let Some(cliprdr::Union::Files(files)) = &clip.union {
+                        self.post_file_audit(
+                            FileAuditType::RemoteReceive,
+                            "",
+                            files
+                                .files
+                                .iter()
+                                .map(|f| (f.name.clone(), f.size as i64))
+                                .collect::<Vec<(String, i64)>>(),
+                            json!({}),
+                        );
+                    } else if let Some(clip) = msg_2_clip(clip) {
                         #[cfg(target_os = "windows")]
                         {
                             self.send_to_cm(ipc::Data::ClipboardFile(clip));
                         }
                         #[cfg(feature = "unix-file-copy-paste")]
                         if crate::is_support_file_copy_paste(&self.lr.version) {
-                            let mut out_msg = None;
+                            let mut out_msgs = vec![];
 
                             #[cfg(target_os = "macos")]
                             if clipboard::platform::unix::macos::should_handle_msg(&clip) {
@@ -2404,7 +2577,7 @@ impl Connection {
                                         });
                                 }
                             } else {
-                                out_msg = unix_file_clip::serve_clip_messages(
+                                out_msgs = unix_file_clip::serve_clip_messages(
                                     ClipboardSide::Host,
                                     clip,
                                     self.inner.id(),
@@ -2413,14 +2586,31 @@ impl Connection {
 
                             #[cfg(not(target_os = "macos"))]
                             {
-                                out_msg = unix_file_clip::serve_clip_messages(
+                                out_msgs = unix_file_clip::serve_clip_messages(
                                     ClipboardSide::Host,
                                     clip,
                                     self.inner.id(),
                                 );
                             }
 
-                            if let Some(msg) = out_msg {
+                            for msg in out_msgs.into_iter() {
+                                if let Some(message::Union::Cliprdr(cliprdr)) = msg.union.as_ref() {
+                                    if let Some(cliprdr::Union::Files(files)) =
+                                        cliprdr.union.as_ref()
+                                    {
+                                        self.post_file_audit(
+                                            FileAuditType::RemoteSend,
+                                            "",
+                                            files
+                                                .files
+                                                .iter()
+                                                .map(|f| (f.name.clone(), f.size as i64))
+                                                .collect::<Vec<(String, i64)>>(),
+                                            json!({}),
+                                        );
+                                        continue;
+                                    }
+                                }
                                 self.send(msg).await;
                             }
                         }
@@ -2624,7 +2814,11 @@ impl Connection {
                             }
                             Some(file_action::Union::SendConfirm(r)) => {
                                 if let Some(job) = fs::get_job(r.id, &mut self.read_jobs) {
-                                    job.confirm(&r);
+                                    job.confirm(&r).await;
+                                } else {
+                                    if let Ok(sc) = r.write_to_bytes() {
+                                        self.send_fs(ipc::FS::SendConfirm(sc));
+                                    }
                                 }
                             }
                             Some(file_action::Union::Rename(r)) => {
@@ -2668,6 +2862,7 @@ impl Connection {
                         file_size: d.file_size,
                         last_modified: d.last_modified,
                         is_upload: true,
+                        is_resume: d.is_resume,
                     }),
                     Some(file_response::Union::Error(e)) => {
                         self.send_fs(ipc::FS::WriteError {
@@ -2716,20 +2911,11 @@ impl Connection {
                         self.update_auto_disconnect_timer();
                     }
                     Some(misc::Union::VideoReceived(_)) => {
-                        video_service::notify_video_frame_fetched(
+                        video_service::notify_video_frame_fetched_by_conn_id(
                             self.inner.id,
                             Some(Instant::now().into()),
                         );
                     }
-                    Some(misc::Union::CloseReason(_)) => {
-                        self.on_close("Peer close", true).await;
-                        raii::AuthedConnID::check_remove_session(
-                            self.inner.id(),
-                            self.session_key(),
-                        );
-                        return false;
-                    }
-
                     Some(misc::Union::RestartRemoteDevice(_)) => {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         if self.restart {
@@ -2893,35 +3079,232 @@ impl Connection {
         true
     }
 
-    fn update_failure(&self, (mut failure, time): ((i32, i32, i32), i32), remove: bool, i: usize) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fill_terminal_user_token(
+        &mut self,
+        _username: &str,
+        _password: &str,
+    ) -> Option<&'static str> {
+        self.terminal_user_token = Some(TerminalUserToken::SelfUser);
+        None
+    }
+
+    // Try to fill user token for terminal connection.
+    // If username is empty, use the user token of the current session.
+    // If username is not empty, try to logon and check if the user is an administrator.
+    //    If the user is an administrator, use the user token of current process (SYSTEM).
+    //    If the user is not an administrator, return an error message.
+    // Note: Only local and domain users are supported, Microsoft account (online account) not supported for now.
+    #[cfg(target_os = "windows")]
+    fn fill_terminal_user_token(&mut self, username: &str, password: &str) -> Option<&'static str> {
+        // No need to check if the password is empty.
+        if !username.is_empty() {
+            return self.handle_administrator_check(username, password);
+        }
+
+        if crate::platform::is_prelogin() {
+            self.terminal_user_token = None;
+            return Some("No active console user logged on, please connect and logon first.");
+        }
+
+        if crate::platform::is_installed() {
+            return self.handle_installed_user();
+        }
+
+        self.terminal_user_token = Some(TerminalUserToken::SelfUser);
+        None
+    }
+
+    #[cfg(target_os = "windows")]
+    fn handle_administrator_check(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Option<&'static str> {
+        let check_admin_res =
+            crate::platform::get_logon_user_token(username, password).map(|token| {
+                let is_token_admin = crate::platform::is_user_token_admin(token);
+                unsafe {
+                    hbb_common::allow_err!(CloseHandle(HANDLE(token as _)));
+                };
+                is_token_admin
+            });
+        match check_admin_res {
+            Ok(Ok(b)) => {
+                if b {
+                    self.terminal_user_token = Some(TerminalUserToken::SelfUser);
+                    None
+                } else {
+                    Some("The user is not an administrator.")
+                }
+            }
+            Ok(Err(e)) => {
+                log::error!("Failed to check if the user is an administrator: {}", e);
+                Some("Failed to check if the user is an administrator.")
+            }
+            Err(e) => {
+                log::error!("Failed to get logon user token: {}", e);
+                Some("Incorrect username or password.")
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn handle_installed_user(&mut self) -> Option<&'static str> {
+        let session_id = crate::platform::get_current_session_id(true);
+        if session_id == 0xFFFFFFFF {
+            return Some("Failed to get current session id.");
+        }
+        let token = crate::platform::get_user_token(session_id, true);
+        if !token.is_null() {
+            match crate::platform::ensure_primary_token(token) {
+                Ok(t) => {
+                    self.terminal_user_token = Some(TerminalUserToken::CurrentLogonUser(t as _));
+                }
+                Err(e) => {
+                    log::error!("Failed to ensure primary token: {}", e);
+                    self.terminal_user_token =
+                        Some(TerminalUserToken::CurrentLogonUser(token as _));
+                }
+            }
+            None
+        } else {
+            log::error!(
+                "Failed to get user token for terminal action, {}",
+                std::io::Error::last_os_error()
+            );
+            Some("Failed to get user token.")
+        }
+    }
+
+    // Try to parse connection IP as IPv6 address, returning /64, /56, and /48 prefixes.
+    // Parsing an IPv4 address just returns None.
+    // note: we specifically don't use hbb_common::is_ipv6_str to avoid divergence issues
+    // between its regex and the system std::net::Ipv6Addr implementation.
+    fn get_ipv6_prefixes(&self) -> Option<(String, String, String)> {
+        fn mask_u128(addr: u128, prefix: u8) -> u128 {
+            let mask = if prefix == 0 || prefix > 128 {
+                0
+            } else {
+                (!0u128) << (128 - prefix)
+            };
+            addr & mask
+        }
+        // eliminate zone-ids like "fe80::1%eth0"
+        let ip_only = self.ip.split('%').next().unwrap_or(&self.ip).trim();
+        let ip = Ipv6Addr::from_str(ip_only).ok()?;
+
+        let as_u128 = u128::from_be_bytes(ip.octets());
+
+        let p64 = Ipv6Addr::from(mask_u128(as_u128, 64).to_be_bytes()).to_string() + "/64";
+        let p56 = Ipv6Addr::from(mask_u128(as_u128, 56).to_be_bytes()).to_string() + "/56";
+        let p48 = Ipv6Addr::from(mask_u128(as_u128, 48).to_be_bytes()).to_string() + "/48";
+
+        Some((p64, p56, p48))
+    }
+
+    fn update_failure(&self, (failure, time): ((i32, i32, i32), i32), remove: bool, i: usize) {
+        fn bump(mut cur: (i32, i32, i32), time: i32) -> (i32, i32, i32) {
+            if cur.0 == time {
+                cur.1 += 1;
+                cur.2 += 1;
+            } else {
+                cur.0 = time;
+                cur.1 = 1;
+                cur.2 += 1;
+            }
+            cur
+        }
+        let map_mutex = &LOGIN_FAILURES[i];
         if remove {
             if failure.0 != 0 {
-                LOGIN_FAILURES[i].lock().unwrap().remove(&self.ip);
+                if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
+                    let mut m = map_mutex.lock().unwrap();
+                    m.remove(&p64);
+                    m.remove(&p56);
+                    m.remove(&p48);
+                    m.remove(&self.ip);
+                } else {
+                    map_mutex.lock().unwrap().remove(&self.ip);
+                }
             }
             return;
         }
-        if failure.0 == time {
-            failure.1 += 1;
-            failure.2 += 1;
+        // Bump the prefixes, fetching existing values
+        if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
+            let mut m = map_mutex.lock().unwrap();
+            for key in [p64, p56, p48] {
+                let cur = m.get(&key).copied().unwrap_or((0, 0, 0));
+                m.insert(key, bump(cur, time));
+            }
+            // Update full IP: bump from the *original* passed-in failure
+            m.insert(self.ip.clone(), bump(failure, time));
         } else {
-            failure.0 = time;
-            failure.1 = 1;
-            failure.2 += 1;
+            // Update full IP: bump from the *original* passed-in failure
+            let mut m = map_mutex.lock().unwrap();
+            m.insert(self.ip.clone(), bump(failure, time));
         }
-        LOGIN_FAILURES[i]
+    }
+
+    async fn check_failure_ipv6_prefix(
+        &mut self,
+        i: usize,
+        time: i32,
+        prefix: &str,
+        prefix_num: i8,
+        thresh: i32,
+    ) -> Option<(((i32, i32, i32), i32), bool)> {
+        let failure_prefix = LOGIN_FAILURES[i]
             .lock()
             .unwrap()
-            .insert(self.ip.clone(), failure);
+            .get(prefix)
+            .copied()
+            .unwrap_or((0, 0, 0));
+
+        if failure_prefix.2 > thresh {
+            self.send_login_error(format!(
+                "Too many wrong attempts for IPv6 prefix /{}",
+                prefix_num
+            ))
+            .await;
+            Self::post_alarm_audit(
+                AlarmAuditType::ExceedIPv6PrefixAttempts,
+                json!({
+                            "ip": self.ip,
+                            "id": self.lr.my_id.clone(),
+                            "name": self.lr.my_name.clone(),
+                }),
+            );
+            Some(((failure_prefix, time), false))
+        } else {
+            None
+        }
     }
 
     async fn check_failure(&mut self, i: usize) -> (((i32, i32, i32), i32), bool) {
+        let time = (get_time() / 60_000) as i32;
+
+        // IPv6 addresses are cheap to make so we check prefix/netblock as well
+        if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
+            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p64, 64, 60).await {
+                return res;
+            }
+            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p56, 56, 80).await {
+                return res;
+            }
+            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p48, 48, 100).await {
+                return res;
+            }
+        }
+
+        // checks IPv6 and IPv4 direct addresses
         let failure = LOGIN_FAILURES[i]
             .lock()
             .unwrap()
             .get(&self.ip)
-            .map(|x| x.clone())
+            .copied()
             .unwrap_or((0, 0, 0));
-        let time = (get_time() / 60_000) as i32;
+
         let res = if failure.2 > 30 {
             self.send_login_error("Too many wrong attempts").await;
             Self::post_alarm_audit(
@@ -3146,6 +3529,7 @@ impl Connection {
                     {
                         return;
                     }
+                    #[allow(unused_mut)]
                     let mut record_changed = true;
                     #[cfg(windows)]
                     if virtual_display_manager::amyuni_idd::is_my_display(&name) {
@@ -3419,6 +3803,50 @@ impl Connection {
         if let Ok(q) = o.terminal_persistent.enum_value() {
             if q != BoolOption::NotSet {
                 self.update_terminal_persistence(q == BoolOption::Yes).await;
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Ok(q) = o.show_my_cursor.enum_value() {
+            if q != BoolOption::NotSet {
+                use crate::whiteboard;
+                self.show_my_cursor = q == BoolOption::Yes;
+                #[cfg(target_os = "windows")]
+                let is_lower_win10 = !crate::platform::windows::is_win_10_or_greater();
+                #[cfg(not(target_os = "windows"))]
+                let is_lower_win10 = false;
+                #[cfg(target_os = "linux")]
+                let is_linux_supported = crate::whiteboard::is_supported();
+                #[cfg(not(target_os = "linux"))]
+                let is_linux_supported = false;
+                let not_support_msg = if is_lower_win10 {
+                    "Windows 10 or greater is required."
+                } else if cfg!(target_os = "linux") && !is_linux_supported {
+                    "This feature is not supported on native Wayland, please install XWayland or switch to X11."
+                } else {
+                    ""
+                };
+                if q == BoolOption::Yes {
+                    if not_support_msg.is_empty() {
+                        whiteboard::register_whiteboard(whiteboard::get_key_cursor(self.inner.id));
+                    } else {
+                        let mut msg_out = Message::new();
+                        let res = MessageBox {
+                            msgtype: "nook-nocancel-hasclose".to_owned(),
+                            title: "Show my cursor".to_owned(),
+                            text: not_support_msg.to_owned(),
+                            link: "".to_owned(),
+                            ..Default::default()
+                        };
+                        msg_out.set_message_box(res);
+                        self.send(msg_out).await;
+                    }
+                } else {
+                    if not_support_msg.is_empty() {
+                        whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(
+                            self.inner.id,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -3767,7 +4195,6 @@ impl Connection {
     #[cfg(feature = "unix-file-copy-paste")]
     async fn handle_file_clip(&mut self, clip: clipboard::ClipboardFile) {
         let is_stopping_allowed = clip.is_stopping_allowed();
-        let is_keyboard_enabled = self.peer_keyboard_enabled();
         let file_transfer_enabled = self.file_transfer_enabled();
         let stop = is_stopping_allowed && !file_transfer_enabled;
         log::debug!(
@@ -3833,12 +4260,19 @@ impl Connection {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     async fn init_terminal_service(&mut self) {
+        debug_assert!(self.terminal_user_token.is_some());
+        let Some(user_token) = self.terminal_user_token.clone() else {
+            // unreachable, but keep it for safety
+            log::error!("Terminal user token is not set.");
+            return;
+        };
         if self.terminal_service_id.is_empty() {
             self.terminal_service_id = terminal_service::generate_service_id();
         }
         let s = Box::new(terminal_service::new(
             self.terminal_service_id.clone(),
             self.terminal_persistent,
+            user_token.to_terminal_service_token(),
         ));
         s.on_subscribe(self.inner.clone());
         self.terminal_generic_service = Some(s);
@@ -3846,9 +4280,15 @@ impl Connection {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     async fn handle_terminal_action(&mut self, action: TerminalAction) -> ResultType<()> {
+        debug_assert!(self.terminal_user_token.is_some());
+        let Some(user_token) = self.terminal_user_token.clone() else {
+            // unreacheable, but keep it for safety
+            bail!("Terminal user token is not set.");
+        };
         let mut proxy = terminal_service::TerminalServiceProxy::new(
             self.terminal_service_id.clone(),
             Some(self.terminal_persistent),
+            user_token.to_terminal_service_token(),
         );
 
         match proxy.handle_action(&action) {
@@ -4040,6 +4480,10 @@ pub enum AlarmAuditType {
     IpWhitelist = 0,
     ExceedThirtyAttempts = 1,
     SixAttemptsWithinOneMinute = 2,
+    // ExceedThirtyLoginAttempts = 3,
+    // MultipleLoginsAttemptsWithinOneMinute = 4,
+    // MultipleLoginsAttemptsWithinOneHour = 5,
+    ExceedIPv6PrefixAttempts = 6,
 }
 
 pub enum FileAuditType {
@@ -4249,6 +4693,15 @@ impl Drop for Connection {
         if let Some(s) = self.terminal_generic_service.as_ref() {
             s.join();
         }
+
+        #[cfg(target_os = "windows")]
+        if let Some(TerminalUserToken::CurrentLogonUser(token)) = self.terminal_user_token.take() {
+            if token != 0 {
+                unsafe {
+                    hbb_common::allow_err!(CloseHandle(HANDLE(token as _)));
+                };
+            }
+        }
     }
 }
 
@@ -4436,6 +4889,7 @@ mod raii {
                 .send((conn_count, remote_count)));
         }
 
+        #[cfg(windows)]
         pub fn non_port_forward_conn_count() -> usize {
             AUTHED_CONNS
                 .lock()
@@ -4551,6 +5005,11 @@ mod raii {
                 scrap::wayland::pipewire::try_close_session();
             }
             Self::check_wake_lock();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                use crate::whiteboard;
+                whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(self.0));
+            }
         }
     }
 }
@@ -4589,5 +5048,12 @@ mod test {
         let pos = msg.cursor_position();
         assert_eq!(pos.x, 510);
         assert_eq!(pos.y, 510);
+    }
+
+    #[test]
+    fn ipv6() {
+        assert!(Ipv6Addr::from_str("::1").is_ok());
+        assert!(Ipv6Addr::from_str("127.0.0.1").is_err());
+        assert!(Ipv6Addr::from_str("0").is_err());
     }
 }

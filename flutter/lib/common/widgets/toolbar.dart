@@ -183,7 +183,7 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
     );
     v.add(
       TTextMenu(
-          child: Text(translate('Terminal')),
+          child: Text('${translate('Terminal')} (beta)'),
           onPressed: () => connectWithToken(isTerminal: true)),
     );
     v.add(
@@ -362,6 +362,11 @@ Future<List<TRadioMenu<String>>> toolbarViewStyle(
     TRadioMenu<String>(
         child: Text(translate('Scale adaptive')),
         value: kRemoteViewStyleAdaptive,
+        groupValue: groupValue,
+        onChanged: onChanged),
+    TRadioMenu<String>(
+        child: Text(translate('Scale custom')),
+        value: kRemoteViewStyleCustom,
         groupValue: groupValue,
         onChanged: onChanged)
   ];
