@@ -1159,10 +1159,6 @@ class RustdeskImpl {
     return Future.value('');
   }
 
-  Future<String> mainGetPermanentPassword({dynamic hint}) {
-    return Future.value('');
-  }
-
   Future<String> mainGetFingerprint({dynamic hint}) {
     return Future.value('');
   }
@@ -1346,9 +1342,9 @@ class RustdeskImpl {
     throw UnimplementedError("mainUpdateTemporaryPassword");
   }
 
-  Future<void> mainSetPermanentPassword(
+  Future<bool> mainSetPermanentPasswordWithResult(
       {required String password, dynamic hint}) {
-    throw UnimplementedError("mainSetPermanentPassword");
+    throw UnimplementedError("mainSetPermanentPasswordWithResult");
   }
 
   Future<bool> mainCheckSuperUserPermission({dynamic hint}) {
@@ -2018,6 +2014,24 @@ class RustdeskImpl {
 
   String sessionGetAuditGuid({required UuidValue sessionId, dynamic hint}) {
     return js.context.callMethod('getByName', ['audit_guid']);
+  }
+
+  bool mainSetCursorPosition({required int x, required int y, dynamic hint}) {
+    return false;
+  }
+
+  bool mainClipCursor(
+      {required int left,
+      required int top,
+      required int right,
+      required int bottom,
+      required bool enable,
+      dynamic hint}) {
+    return false;
+  }
+
+  String mainResolveAvatarUrl({required String avatar, dynamic hint}) {
+    return js.context.callMethod('getByName', ['resolve_avatar_url', avatar])?.toString() ?? avatar;
   }
 
   void dispose() {}
